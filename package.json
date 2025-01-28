@@ -19,7 +19,9 @@
     "mongoose": "^8.9.5",
     "multer": "^1.4.5-lts.1",
     "openai": "^4.80.1",
-    "stopword": "^3.1.4"
+    "stopword": "^3.1.4",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"

@@ -4,8 +4,10 @@ const bodyParser = require("body-parser");
 const cors = require("cors");
 const moment = require("moment");
 const stopword = require("stopword");
-const { Configuration, OpenAIApi } = require("openai");
-const { HfInference } = require("@huggingface/inference");
+const { OpenAI } = require("openai");
+const multer = require("multer");
+const swaggerJsdoc = require("swagger-jsdoc");
+const swaggerUi = require("swagger-ui-express");
 
 require("dotenv").config();
 
@@ -15,11 +17,10 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// OpenAI API and Hugging Face Inference
-const openai = new OpenAIApi(
-    new Configuration({ apiKey: process.env.OPENAI_API_KEY })
-);
-const hf = new HfInference(process.env.HF_API_KEY);
+// OpenAI API
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+});
 
 // MongoDB Connection
 const mongoURI =
@@ -52,25 +53,62 @@ const hinglishStopWords = [
     "se",
     "hi",
     "bhi",
+    "h",
+    "to",
+    "mai",
+    "tha"
 ];
 
 // Function: Parse Chat Text
 function parseChatText(chatText) {
     const lines = chatText.split("\n");
     const messages = [];
-    const regex = /^\[(\d{2}\/\d{2}\/\d{4}), (\d{1,2}:\d{2} (AM|PM))\] (.+?): (.+)$/;
+    const regex = /^(\d{2}\/\d{2}\/\d{2}), (\d{2}:\d{2}) - (.+?): (.+)$/;
 
     lines.forEach((line) => {
         const match = line.match(regex);
         if (match) {
-            const [, date, time, , sender, message] = match;
-            const timestamp = moment(`${date} ${time}`, "MM/DD/YYYY hh:mm A").toDate();
+            const [_, date, time, sender, message] = match;
+
+            // Combine date and time to create a timestamp
+            const timestamp = moment(`${date}, ${time}`, "DD/MM/YY, HH:mm").toDate();
+
             messages.push({ sender, message, timestamp });
         }
     });
 
     return messages;
 }
+
+function groupMessagesBySession(messages) {
+    const groupedMessages = [];
+    let currentGroup = [];
+
+    for (let i = 0; i < messages.length; i++) {
+        const currentMessage = messages[i];
+        const previousMessage = messages[i - 1];
+
+        if (
+            previousMessage &&
+            moment(currentMessage.timestamp).diff(moment(previousMessage.timestamp), "hours") >= 24
+        ) {
+            // If the time difference is 24 hours or more, finalize the current group
+            groupedMessages.push(currentGroup);
+            currentGroup = [];
+        }
+
+        // Add the current message to the group
+        currentGroup.push(currentMessage);
+    }
+
+    // Push the last group
+    if (currentGroup.length > 0) {
+        groupedMessages.push(currentGroup);
+    }
+
+    return groupedMessages;
+}
+
 
 // Function: Analyze with LLM (OpenAI)
 async function analyzeWithLLM(message) {
@@ -81,54 +119,122 @@ async function analyzeWithLLM(message) {
       2. Whether it contains any red flags (if yes, list them).
       3. Whether it contains compliments (if yes, list them).`;
 
-        const response = await openai.createCompletion({
-            model: "text-davinci-003",
-            prompt,
+        const response = await openai.chat.completions.create({
+            model: "gpt-3.5-turbo",
+            messages: [{ role: "system", content: prompt }],
             max_tokens: 100,
         });
 
-        return response.data.choices[0].text.trim();
+        return response.choices[0].message.content.trim();
     } catch (error) {
         console.error("Error with LLM analysis:", error);
         return null;
     }
 }
+async function analyzeSessionWithLLM(session) {
+    try {
+        // Format the session as a conversation for the prompt
+        const formattedSession = session
+            .map(({ sender, message }) => `- [${sender}] ${message}`)
+            .join("\n");
 
-async function analyzeMessageWithHuggingFace(message) {
-    const result = await hf.textClassification({
-        model: "nlptown/bert-base-multilingual-uncased-sentiment",
-        inputs: message,
-    });
-    console.log(result);
-    return result;
+        const prompt = `Analyze the following chat session:
+        ${formattedSession}
+        
+        Provide the following insights:
+        1. Overall sentiment of the conversation (Positive, Negative, Neutral, Lovable, Annoying, Avoiding).
+        2. List any red flags in the conversation.
+        3. Identify compliments in the conversation, if any.
+        4. Provide a summary of the conversation.`;
+
+        const response = await openai.chat.completions.create({
+            model: "gpt-3.5-turbo",
+            messages: [{ role: "system", content: prompt }],
+            max_tokens: 500,
+        });
+
+        return response.choices[0].message.content.trim();
+    } catch (error) {
+        console.error("Error analyzing session with LLM:", error);
+        return null;
+    }
 }
 
-// Routes
-app.get("/", (req, res) => {
-    res.send("Welcome to the Message Analyzer API!");
-});
 
-// Upload Chat History
-app.post("/upload", async (req, res) => {
+// Multer setup for file upload
+const upload = multer({ storage: multer.memoryStorage() });
+
+/**
+ * Swagger Configuration
+ */
+const swaggerOptions = {
+    definition: {
+        openapi: "3.0.0",
+        info: {
+            title: "Message Analyzer API",
+            version: "1.0.0",
+            description: "API for analyzing chat messages",
+        },
+    },
+    apis: ["./index.js", "./index1.js"], // Point to this file for Swagger comments
+};
+
+const swaggerDocs = swaggerJsdoc(swaggerOptions);
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerDocs));
+
+/**
+ * @swagger
+ * /upload-and-analyze:
+ *   post:
+ *     summary: Upload a chat text file and get analysis results.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Successfully analyzed chat history.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 messageCounts:
+ *                   type: object
+ *                 sortedTopWords:
+ *                   type: object
+ *                 averageResponseTime:
+ *                   type: number
+ *                 interestLevel:
+ *                   type: object
+ *                 compliments:
+ *                   type: object
+ *                 redFlags:
+ *                   type: array
+ *                 monthlyMessages:
+ *                   type: object
+ */
+app.post("/upload-and-analyze", upload.single("file"), async (req, res) => {
     try {
-        const chatText = req.body.chatText; // Expecting plain text chat history
-        const messages = parseChatText(chatText);
-        await Message.insertMany(messages);
-        res.status(200).json({ message: "Chat history uploaded successfully!" });
-    } catch (error) {
-        console.error("Error uploading chat history:", error);
-        res.status(500).json({ error: "Failed to upload chat history." });
-    }
-});
+        const file = req.file;
 
-// Analyze Chat Data
-app.post("/analyze", async (req, res) => {
-    try {
-        const messages = req.body.messages; // Expecting an array of messages
-
-        if (!messages || !Array.isArray(messages)) {
-            return res.status(400).json({ error: "Invalid messages format" });
+        if (!file) {
+            return res.status(400).json({ error: "File is required" });
         }
+
+        const chatText = file.buffer.toString("utf-8");
+
+        // Parse chat text into structured messages
+        const messages = parseChatText(chatText);
+        console.log(messages)
+
+        const groupedSessions = groupMessagesBySession(messages);
 
         // Message Count per Person
         const messageCounts = messages.reduce((acc, msg) => {
@@ -167,6 +273,7 @@ app.post("/analyze", async (req, res) => {
                 responseTimes.push(diff);
             }
         }
+
         const averageResponseTime =
             responseTimes.reduce((a, b) => a + b, 0) / responseTimes.length;
 
@@ -177,122 +284,7 @@ app.post("/analyze", async (req, res) => {
         const monthlyMessages = {};
 
         for (const { sender, message, timestamp } of messages) {
-            const llmAnalysis = await analyzeWithLLM(message);
-
-            if (llmAnalysis) {
-                const sentimentMatch = llmAnalysis.match(/Sentiment: (.+)/i);
-                const redFlagMatch = llmAnalysis.match(/Red flags: (.+)/i);
-                compliments = llmAnalysis.match(/compliments: (.+)/i);
-
-                // Sentiment Analysis
-                if (sentimentMatch) {
-                    const sentiment = sentimentMatch[1].toLowerCase();
-                    interestLevel[sender] =
-                        (interestLevel[sender] || 0) +
-                        (sentiment === "positive" ? 2 : sentiment === "neutral" ? 1 : 0);
-                }
-
-                // Red Flags
-                if (redFlagMatch) {
-                    const detectedFlags = redFlagMatch[1];
-                    if (detectedFlags && detectedFlags !== "None") {
-                        redFlags.push({ sender, message, detectedFlags });
-                    }
-                }
-            }
-
-            // Monthly Messages
-            const month = moment(timestamp).format("MMM YYYY");
-            monthlyMessages[month] = monthlyMessages[month] || { [sender]: 0 };
-            monthlyMessages[month][sender] =
-                (monthlyMessages[month][sender] || 0) + 1;
-        }
-
-        // Response Object
-        const analysis = {
-            messageCounts,
-            sortedTopWords,
-            averageResponseTime,
-            interestLevel,
-            compliments,
-            redFlags,
-            monthlyMessages,
-        };
-
-        res.status(200).json(analysis);
-    } catch (error) {
-        console.error("Error in /analyze:", error);
-        res.status(500).json({ error: "Failed to analyze messages." });
-    }
-});
-
-
-// Combined Upload and Analyze Endpoint
-app.post("/upload-and-analyze", async (req, res) => {
-    try {
-        const chatText = req.body.chatText; // Expecting plain text chat history
-
-        if (!chatText) {
-            return res.status(400).json({ error: "Chat text is required" });
-        }
-
-        // Parse chat text into structured messages
-        const messages = parseChatText(chatText);
-
-        // Optional: Save to database
-        try {
-            await Message.insertMany(messages);
-        } catch (dbError) {
-            console.error("Error saving messages to database:", dbError);
-            // Continue even if saving to DB fails
-        }
-
-        // Perform analysis on the parsed messages
-        const messageCounts = messages.reduce((acc, msg) => {
-            acc[msg.sender] = (acc[msg.sender] || 0) + 1;
-            return acc;
-        }, {});
-
-        const topWords = {};
-        messages.forEach(({ sender, message }) => {
-            const words = stopword.removeStopwords(
-                message.toLowerCase().split(" "),
-                hinglishStopWords
-            );
-            topWords[sender] = topWords[sender] || {};
-            words.forEach((word) => {
-                topWords[sender][word] = (topWords[sender][word] || 0) + 1;
-            });
-        });
-
-        const sortedTopWords = Object.fromEntries(
-            Object.entries(topWords).map(([sender, words]) => [
-                sender,
-                Object.entries(words).sort(([, a], [, b]) => b - a).slice(0, 5),
-            ])
-        );
-
-        const responseTimes = [];
-        for (let i = 1; i < messages.length; i++) {
-            if (messages[i].sender !== messages[i - 1].sender) {
-                const diff = moment(messages[i].timestamp).diff(
-                    moment(messages[i - 1].timestamp),
-                    "minutes"
-                );
-                responseTimes.push(diff);
-            }
-        }
-
-        const averageResponseTime =
-            responseTimes.reduce((a, b) => a + b, 0) / responseTimes.length;
-
-        const interestLevel = {};
-        const compliments = {};
-        const redFlags = [];
-        const monthlyMessages = {};
-
-        for (const { sender, message, timestamp } of messages) {
-            const llmAnalysis = await analyzeWithLLM(message);
+            const llmAnalysis = await analyzeSessionWithLLM(message);
 
             if (llmAnalysis) {
                 const sentimentMatch = llmAnalysis.match(/Sentiment: (.+)/i);
@@ -346,4 +338,6 @@ app.post("/upload-and-analyze", async (req, res) => {
 
 // Start the Server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+app.listen(PORT, () =>
+    console.log(`Server is running on port ${PORT}. Visit /api-docs for Swagger UI`)
+);
