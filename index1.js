@@ -229,30 +229,94 @@ app.post("/upload-and-analyze", upload.single("file"), async (req, res) => {
         }
 
         const chatText = file.buffer.toString("utf-8");
-
-        // Parse chat text into structured messages
         const messages = parseChatText(chatText);
-        console.log(messages)
-
         const groupedSessions = groupMessagesBySession(messages);
 
-        // Message Count per Person
-        const messageCounts = messages.reduce((acc, msg) => {
-            acc[msg.sender] = (acc[msg.sender] || 0) + 1;
-            return acc;
-        }, {});
-
-        // Top Words per Person
+        const messageCounts = {};
         const topWords = {};
-        messages.forEach(({ sender, message }) => {
-            const words = stopword.removeStopwords(
-                message.toLowerCase().split(" "),
-                hinglishStopWords
-            );
-            topWords[sender] = topWords[sender] || {};
-            words.forEach((word) => {
-                topWords[sender][word] = (topWords[sender][word] || 0) + 1;
+        const compliments = {};
+        const redFlags = {};
+        const sessionAnalysis = [];
+        const monthlyMessages = {};
+        const interestLevel = {};
+        const responseTimes = {};
+
+        // Analyze each session
+        for (const session of groupedSessions) {
+            const sessionAnalysisResult = await analyzeSessionWithLLM(session);
+
+            if (sessionAnalysisResult) {
+                const sentimentMatch = sessionAnalysisResult.match(/Overall sentiment: (.+)/i);
+                const redFlagMatch = sessionAnalysisResult.match(/Red flags: (.+)/i);
+                const complimentMatch = sessionAnalysisResult.match(/Compliments: (.+)/i);
+                const summaryMatch = sessionAnalysisResult.match(/Summary: (.+)/i);
+
+                const sessionSentiment = sentimentMatch ? sentimentMatch[1].toLowerCase() : "neutral";
+
+                // Calculate interest level based on sentiment
+                session.forEach(({ sender }) => {
+                    interestLevel[sender] =
+                        (interestLevel[sender] || 0) +
+                        (sessionSentiment === "positive" ? 2 : sessionSentiment === "neutral" ? 1 : 0);
+
+                    if (redFlagMatch && redFlagMatch[1] !== "None") {
+                        redFlags[sender] = redFlags[sender] || [];
+                        redFlags[sender].push(redFlagMatch[1]);
+                    }
+
+                    if (complimentMatch && complimentMatch[1] !== "None") {
+                        compliments[sender] = compliments[sender] || 0;
+                        compliments[sender] += complimentMatch[1].split(", ").length;
+                    }
+                });
+
+                sessionAnalysis.push({
+                    session,
+                    overallSentiment: sessionSentiment,
+                    redFlags: redFlagMatch ? redFlagMatch[1].split(", ") : [],
+                    compliments: complimentMatch ? complimentMatch[1].split(", ") : [],
+                    summary: summaryMatch ? summaryMatch[1] : "No summary provided.",
+                });
+            }
+
+            // Analyze individual messages
+            session.forEach((currentMessage, i) => {
+                const sender = currentMessage.sender;
+                messageCounts[sender] = (messageCounts[sender] || 0) + 1;
+
+                // Response time calculation
+                if (i > 0 && session[i - 1].sender !== sender) {
+                    const timeDiff = moment(currentMessage.timestamp).diff(
+                        moment(session[i - 1].timestamp),
+                        "minutes"
+                    );
+                    responseTimes[sender] = responseTimes[sender] || [];
+                    responseTimes[sender].push(timeDiff);
+                }
+
+                // Top words calculation
+                const words = stopword.removeStopwords(
+                    currentMessage.message.toLowerCase().split(" "),
+                    hinglishStopWords
+                );
+                topWords[sender] = topWords[sender] || {};
+                words.forEach((word) => {
+                    topWords[sender][word] = (topWords[sender][word] || 0) + 1;
+                });
+
+                // Monthly message count
+                const month = moment(currentMessage.timestamp).format("MMM YYYY");
+                monthlyMessages[month] = monthlyMessages[month] || { [sender]: 0 };
+                monthlyMessages[month][sender] = (monthlyMessages[month][sender] || 0) + 1;
             });
+        }
+
+        // Average response time calculation
+        const averageResponseTime = {};
+        Object.keys(responseTimes).forEach((sender) => {
+            const totalResponseTime = responseTimes[sender].reduce((a, b) => a + b, 0);
+            averageResponseTime[sender] =
+                totalResponseTime / (responseTimes[sender].length || 1);
         });
 
         const sortedTopWords = Object.fromEntries(
@@ -262,79 +326,25 @@ app.post("/upload-and-analyze", upload.single("file"), async (req, res) => {
             ])
         );
 
-        // Response Time Analysis
-        const responseTimes = [];
-        for (let i = 1; i < messages.length; i++) {
-            if (messages[i].sender !== messages[i - 1].sender) {
-                const diff = moment(messages[i].timestamp).diff(
-                    moment(messages[i - 1].timestamp),
-                    "minutes"
-                );
-                responseTimes.push(diff);
-            }
-        }
-
-        const averageResponseTime =
-            responseTimes.reduce((a, b) => a + b, 0) / responseTimes.length;
-
-        // Sentiment, Compliments, and Red Flags
-        const interestLevel = {};
-        const compliments = {};
-        const redFlags = [];
-        const monthlyMessages = {};
-
-        for (const { sender, message, timestamp } of messages) {
-            const llmAnalysis = await analyzeSessionWithLLM(message);
-
-            if (llmAnalysis) {
-                const sentimentMatch = llmAnalysis.match(/Sentiment: (.+)/i);
-                const redFlagMatch = llmAnalysis.match(/Red flags: (.+)/i);
-                const complimentMatch = llmAnalysis.match(/Compliments: (.+)/i);
-
-                if (sentimentMatch) {
-                    const sentiment = sentimentMatch[1].toLowerCase();
-                    interestLevel[sender] =
-                        (interestLevel[sender] || 0) +
-                        (sentiment === "positive" ? 2 : sentiment === "neutral" ? 1 : 0);
-                }
-
-                if (redFlagMatch) {
-                    const detectedFlags = redFlagMatch[1];
-                    if (detectedFlags && detectedFlags !== "None") {
-                        redFlags.push({ sender, message, detectedFlags });
-                    }
-                }
-
-                if (complimentMatch) {
-                    const detectedCompliments = complimentMatch[1].split(", ");
-                    compliments[sender] =
-                        (compliments[sender] || 0) + detectedCompliments.length;
-                }
-            }
-
-            const month = moment(timestamp).format("MMM YYYY");
-            monthlyMessages[month] = monthlyMessages[month] || { [sender]: 0 };
-            monthlyMessages[month][sender] =
-                (monthlyMessages[month][sender] || 0) + 1;
-        }
-
-        // Return the analysis results
         const analysis = {
             messageCounts,
             sortedTopWords,
             averageResponseTime,
-            interestLevel,
+            interestLevel, // Included interest level
             compliments,
             redFlags,
             monthlyMessages,
+            sessionAnalysis,
         };
 
-        res.status(200).json(analysis);
+        res.status(200).json({ analysis, groupedSessions });
     } catch (error) {
         console.error("Error in /upload-and-analyze:", error);
         res.status(500).json({ error: "Failed to process and analyze chat." });
     }
 });
+
+
 
 // Start the Server
 const PORT = process.env.PORT || 5000;
